@@ -6,6 +6,9 @@
   及其所依据的修订号;
 - assignment_decisions 表保存评审人对当前发布版分配关系的确认/回避决定
   (按发布序号隔离);
+- submitted_reviews 表保存评审人对"当前发布版中已确认且未回避"槽位的正式评分
+  与评语 (按发布序号隔离; 每个有效槽位至多一份, 以收据 receipt 标识;
+  补位发布时连续保留的确认槽位连同评语一起复制到新序号);
 - reviewer_recusals 表保存评审人声明过的硬回避, 后续普通求解与补位都必须遵守;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
@@ -57,6 +60,20 @@ CREATE TABLE IF NOT EXISTS assignment_decisions (
     state       TEXT NOT NULL CHECK (state IN ('confirmed', 'recused')),
     reason      TEXT,            -- 回避原因 (recused 时非空)
     decided_at  TEXT NOT NULL,
+    PRIMARY KEY (serial, paper_id, reviewer_id)
+);
+-- 评审人对"已确认且未回避"槽位提交的正式评分与评语 (按发布序号 serial 隔离;
+-- 每个有效任务槽位至多一份; receipt 为首次提交时发放的收据, 相同内容重试原样返回。
+-- receipt 不设全局唯一: 补位发布连续保留的确认槽位沿用同一份评语与同一收据,
+-- 旧序号行保留供会务方追溯, 因此同一收据可随不同 serial 各存一行)
+CREATE TABLE IF NOT EXISTS submitted_reviews (
+    serial       INTEGER NOT NULL,
+    paper_id     TEXT NOT NULL,
+    reviewer_id  TEXT NOT NULL,
+    score        INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+    comment      TEXT NOT NULL,
+    receipt      TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
     PRIMARY KEY (serial, paper_id, reviewer_id)
 );
 -- 评审人一旦对某篇论文声明回避, 即成为后续所有分配 (含补位) 的硬回避

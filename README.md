@@ -40,6 +40,24 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 - 回避后**当前发布方案不变**，仍可供会务方核对（每个槽位带 `confirmed/recused/pending`
   状态），其他评审人取稿不受影响。
 
+**正式评语收集（已确认任务）**：评审人凭现有本人凭据（`X-Reviewer-Id` +
+`X-Reviewer-Credential`）对**当前发布版中已确认且未回避**的槽位提交
+**1～5 的整数评分**与**非空评语**，请求体须携带所针对的**发布序号 `serial`**：
+
+- 提交在**同一个写事务**内核对发布序号、（论文, 评审人）分配关系与决定状态：
+  序号过期/超前 `409`；尚未发布、论文不存在、未分配给本人或已被移出当前方案 `404`；
+  槽位为 `pending` 或 `recused` `409`；评分非 1～5 整数或评语为空白 `422`；
+  被拒请求**不落库**，也不推进资料修订号；
+- **同一有效任务只收一份**：评分与评语（首尾空白归一化后）**完全相同的重试**幂等返回
+  **原收据 `receipt`**（`changed=false`）；**内容不同**返回 `409` 冲突，已存评语不变；
+- 评语收集不影响资料修订号、发布序号与补位求解；
+- **会务方可按论文**查看当前两名评审人的提交进度（已确认数/已交数/是否齐全）与评语全文；
+  补位发布时**连续保留的确认槽位沿用原评语（同收据）**，**被移出槽位的评语仅供会务方追溯**
+  （响应中的 `archived_reviews`），**不计入新方案进度**；同一评审人**后来重新获得该稿**时
+  属于新序号下的新槽位，**不得复用旧评语**，须重新确认并重新提交；
+- 评审人仅可查看**本人当前有效任务**上的评语（`GET /reviewer/reviews`），
+  看不到另一评审人的评语，响应也不含作者机构。
+
 **补位预演与补位发布**：会务方以**当前发布版 + 当前资料修订号**预演补位
 （`POST /assignment/backfill/dry-run`）：
 
@@ -56,8 +74,8 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 
 | 角色 | 凭据 | 权限 |
 |---|---|---|
-| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因 |
-| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 仅可读取**已发布方案中分配给自己**的匿名稿（不含作者机构） |
+| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度 |
+| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语 |
 
 ## 一键启动（Docker Compose）
 
@@ -119,14 +137,19 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` |
 | POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422` |
 | GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态 |
+| GET | `/papers/{paper_id}/reviews` | 会务方按论文查看当前两名评审人的评语提交进度、评语全文，及被移出槽位的追溯评语（`archived_reviews`） |
 | GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`；已回避论文不返稿，仅列于 `recused`） |
 | POST | `/reviewer/assignments/{paper_id}/decision` | 评审人提交 `{"paper_id","decision":"confirm"|"recuse","reason"?}`；幂等；未分配 `404`，已回避再确认 `409`，空回避原因 `422` |
+| POST | `/reviewer/assignments/{paper_id}/review` | 评审人提交 `{"paper_id","serial","score":1~5整数,"comment"}`；同内容重试返原收据，内容不同 `409`，序号过期/超前 `409`，未分配/已移出 `404`，未确认/已回避 `409`，非法评分/空评语 `422` |
+| GET | `/reviewer/reviews` | 评审人查看本人当前有效任务上已提交的评语（不含他人评语与作者机构） |
 
 ## 调用示例
 
 完整可运行脚本见 [`examples/demo.sh`](examples/demo.sh)（服务启动后执行 `./examples/demo.sh`）；
-本轮"确认/回避 + 补位"流程见 [`examples/backfill.sh`](examples/backfill.sh)
-（`./examples/backfill.sh`，建议对新库运行）。
+确认/回避 + 补位流程见 [`examples/backfill.sh`](examples/backfill.sh)
+（`./examples/backfill.sh`，建议对新库运行）；
+本轮正式评语收集流程见 [`examples/reviews.sh`](examples/reviews.sh)
+（`./examples/reviews.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -188,6 +211,36 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 评审人取稿响应新增 `states`（本人在当前发布版各槽位的 `confirmed/recused/pending`）
 与 `recused`（已回避论文编号、本人填写的原因、时间）；`assignments` 中不再出现已回避论文。
 
+### 本轮用法：正式评分与评语收集
+
+```bash
+# 11. 评审人先确认任务 (仅 confirmed 槽位可交正式评语), 再提交 1~5 整数评分与非空评语
+curl -X POST $BASE/reviewer/assignments/P1/review \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "serial": S, "score": 4, "comment": "选题重要, 建议补充消融实验。"}'
+# -> {"ok":true,"score":4,"comment":"...","receipt":"rvw-xxxx","changed":true,"serial":S,...}
+
+# 12. 完全相同的重试 (评分+评语一致, 首尾空白归一化) -> 原收据, changed=false
+#     内容不同 -> 409 冲突, 已存评语不变; 过期/超前 serial -> 409
+# 13. 评审人查看本人当前有效任务的评语 (看不到另一评审人, 也无作者机构)
+curl $BASE/reviewer/reviews -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret'
+# -> {"reviewer_id":"R1","serial":S,"reviews":[{"paper_id":"P1","score":4,"comment":"...","receipt":"rvw-xxxx",...}]}
+
+# 14. 会务方按论文查看两名评审人的提交进度与评语全文
+curl $BASE/papers/P1/reviews -H "$ORG"
+# -> {"paper_id":"P1","serial":S,
+#     "progress":{"slots":2,"confirmed":2,"submitted":1,"complete":false},
+#     "slots":[{"reviewer_id":"R1","state":"confirmed","submitted":true,"review":{...}},
+#              {"reviewer_id":"R2","state":"confirmed","submitted":false,"review":null}],
+#     "archived_reviews":[]}
+```
+
+补位发布成功后，响应新增 `carried_reviews`（连续保留确认槽位所沿用的评语份数）：
+沿用的评语在新序号下**收据与内容不变**；被移出槽位的评语不再出现在任何人的当前视图，
+仅由会务方在该论文的 `archived_reviews`（带原 `serial`）中追溯；同一人后来重新获稿时
+须重新确认并提交新评语（新收据）。
+
 预演响应示例（可行）：
 
 ```json
@@ -224,9 +277,9 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 | 状态码 | 场景 |
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
-| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己**的论文提交决定；尚无发布版时补位预演/发布 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认 |
-| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布 |
+| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布 |
+| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突） |
+| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致 |
 
 排除/限制原因代码：`same_institution_as_author`（与作者同机构）、`on_reviewer_avoid_list`
 （在回避名单）、`hard_recusal_after_decline`（评审人发布后声明回避形成的硬回避）、
@@ -245,14 +298,16 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语
   solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断）
   db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务
   schemas.py  # 请求体模型与校验
-tests/test_api.py       # 原有 24 个接口与求解器测试（含并发发布测试）
-tests/test_backfill.py  # 本轮确认/回避/硬回避/补位预演与发布测试
+tests/test_api.py       # 原有接口与求解器测试（含并发发布测试）
+tests/test_backfill.py  # 确认/回避/硬回避/补位预演与发布测试
+tests/test_reviews.py   # 本轮正式评分/评语、收据幂等与冲突、进度与归档、补位沿用测试
 examples/demo.sh        # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
-examples/backfill.sh    # 本轮端到端示例（决定 -> 补位预演 -> 双版本复核发布）
+examples/backfill.sh    # 确认/回避 -> 补位预演 -> 双版本复核发布示例
+examples/reviews.sh     # 本轮端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
 Dockerfile / docker-compose.yml
 ```
 
