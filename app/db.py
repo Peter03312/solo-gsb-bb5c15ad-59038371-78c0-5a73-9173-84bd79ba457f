@@ -6,6 +6,8 @@
   及其所依据的修订号;
 - assignment_decisions 表保存评审人对当前发布版分配关系的确认/回避决定
   (按发布序号隔离);
+- assignment_reviews 表保存评审人对已确认任务提交的正式评语 (按发布序号隔离,
+  同一任务只收一份; 补位发布时随连续保留的确认槽位一并沿用);
 - reviewer_recusals 表保存评审人声明过的硬回避, 后续普通求解与补位都必须遵守;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
@@ -57,6 +59,17 @@ CREATE TABLE IF NOT EXISTS assignment_decisions (
     state       TEXT NOT NULL CHECK (state IN ('confirmed', 'recused')),
     reason      TEXT,            -- 回避原因 (recused 时非空)
     decided_at  TEXT NOT NULL,
+    PRIMARY KEY (serial, paper_id, reviewer_id)
+);
+-- 评审人对已确认任务提交的正式评语 (按发布序号 serial 隔离; 同一任务只收一份)
+CREATE TABLE IF NOT EXISTS assignment_reviews (
+    serial       INTEGER NOT NULL,
+    paper_id     TEXT NOT NULL,
+    reviewer_id  TEXT NOT NULL,
+    score        INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+    comment      TEXT NOT NULL,
+    receipt      TEXT NOT NULL,  -- 评语收据号; 补位沿用时保持不变
+    submitted_at TEXT NOT NULL,
     PRIMARY KEY (serial, paper_id, reviewer_id)
 );
 -- 评审人一旦对某篇论文声明回避, 即成为后续所有分配 (含补位) 的硬回避

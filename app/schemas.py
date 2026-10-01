@@ -49,3 +49,10 @@ class AssignmentDecisionIn(BaseModel):
 class BackfillPublishIn(BaseModel):
     base_revision: int = Field(ge=0, description="补位预演结果中返回的资料修订号")
     base_serial: int = Field(ge=0, description="补位预演所基于的发布序号; 期间发生过任何发布则过期")
+
+
+class ReviewSubmissionIn(BaseModel):
+    paper_id: str = Field(min_length=1, max_length=128, description="当前发布版中分配给本人且已确认的论文编号")
+    serial: int = Field(ge=0, description="提交所针对的发布序号; 与当前发布序号不一致 (过期) 将被拒绝")
+    score: StrictInt = Field(ge=1, le=5, description="1~5 的整数评分")
+    comment: str = Field(min_length=1, max_length=4000, description="非空评语 (空白字符串视为空)")

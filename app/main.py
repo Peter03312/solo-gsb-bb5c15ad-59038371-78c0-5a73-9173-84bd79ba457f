@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from .schemas import (
     PublishIn,
     ReviewerIn,
     ReviewerUpdate,
+    ReviewSubmissionIn,
 )
 from .solver import Paper, Reviewer, compute_assignment, compute_backfill
 
@@ -147,6 +149,24 @@ def _load_decisions(conn, serial):
             (serial,),
         ).fetchall()
     }
+
+
+def _load_reviews(conn, serial):
+    """读取某发布序号下每个分配槽位的评语。返回 {(paper_id, reviewer_id): row}。"""
+    return {
+        (r["paper_id"], r["reviewer_id"]): r
+        for r in conn.execute(
+            "SELECT paper_id, reviewer_id, score, comment, receipt, submitted_at"
+            " FROM assignment_reviews WHERE serial = ?",
+            (serial,),
+        ).fetchall()
+    }
+
+
+def _review_receipt(serial, paper_id, reviewer_id, score, comment, submitted_at):
+    """评语收据号: 由任务标识与内容哈希生成; 补位沿用时收据号不变, 同一收据号即同一份评语。"""
+    raw = f"{serial}|{paper_id}|{reviewer_id}|{score}|{comment}|{submitted_at}"
+    return "rv_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def _confirmed_map(plan, decisions):
@@ -417,6 +437,78 @@ def get_published(_: bool = Depends(require_organizer)):
     }
 
 
+@app.get("/assignment/reviews")
+def organizer_review_progress(_: bool = Depends(require_organizer)):
+    """会务方按论文查看当前发布版两名评审人的评语提交进度与评语内容。
+
+    - 进度仅统计当前发布序号上的评语 (随连续保留的确认槽位沿用过来的评语计入);
+    - 历史发布序号上的评语 (移出槽位 / 重新发布遗留) 列入 archived 仅供追溯,
+      不计入当前进度; carried_into_current 标记该份评语是否被沿用至当前发布版。
+    """
+    with db.read_txn() as conn:
+        row = _load_published(conn)
+        if row is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案")
+        serial = row["serial"]
+        plan = json.loads(row["plan"])
+        decisions = _load_decisions(conn, serial)
+        current = _load_reviews(conn, serial)
+        current_receipts = {r["receipt"] for r in current.values()}
+        papers = {}
+        for pid in sorted(plan):
+            slots, submitted = [], 0
+            for rid in plan[pid]:
+                d = decisions.get((pid, rid))
+                rv = current.get((pid, rid))
+                if rv is not None:
+                    submitted += 1
+                slots.append(
+                    {
+                        "reviewer_id": rid,
+                        "state": d["state"] if d else "pending",
+                        "submitted": rv is not None,
+                        "review": (
+                            {
+                                "score": rv["score"],
+                                "comment": rv["comment"],
+                                "receipt": rv["receipt"],
+                                "submitted_at": rv["submitted_at"],
+                            }
+                            if rv is not None
+                            else None
+                        ),
+                    }
+                )
+            papers[pid] = {
+                "expected": len(plan[pid]),
+                "submitted": submitted,
+                "reviewers": slots,
+            }
+        archived = [
+            {
+                "serial": r["serial"],
+                "paper_id": r["paper_id"],
+                "reviewer_id": r["reviewer_id"],
+                "score": r["score"],
+                "comment": r["comment"],
+                "receipt": r["receipt"],
+                "submitted_at": r["submitted_at"],
+                "carried_into_current": r["receipt"] in current_receipts,
+            }
+            for r in conn.execute(
+                "SELECT * FROM assignment_reviews WHERE serial != ?"
+                " ORDER BY serial, paper_id, reviewer_id",
+                (serial,),
+            ).fetchall()
+        ]
+    return {
+        "serial": serial,
+        "revision": row["revision"],
+        "papers": papers,
+        "archived": archived,
+    }
+
+
 # ---------------------------------------------------------------- 评审人视图
 
 # ---------------------------------------------------------------- 评审人决定与视图
@@ -535,22 +627,126 @@ def submit_decision(
         }
 
 
+@app.post("/reviewer/assignments/{paper_id}/review")
+def submit_review(
+    paper_id: str,
+    body: ReviewSubmissionIn,
+    reviewer_id: str = Depends(require_reviewer),
+):
+    """评审人对当前发布版中本人已确认且未回避的任务提交正式评语 (评分 + 评语)。
+
+    - 在同一个写事务内核对: 发布序号 (过期 409)、分配关系 (未分配/论文不存在 404)、
+      决定状态 (未确认/已回避 409); 所有拒绝均不落库;
+    - 同一有效任务只收一份评语: 完全相同的重试返回原收据 (changed=false),
+      内容不同则 409 冲突;
+    - 评分须为 1~5 的整数, 评语须非空 (422);
+    - 评语不推进资料修订号 (不影响分配方案的版本判定)。
+    """
+    if body.paper_id != paper_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"路径中的论文编号 ({paper_id}) 与请求体 ({body.paper_id}) 不一致",
+        )
+    comment = body.comment.strip()
+    if not comment:
+        raise HTTPException(status_code=422, detail="评语必须非空 (comment is required)")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 不存在可操作的任务")
+        serial = published["serial"]
+        if body.serial != serial:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"发布序号已过期: 提交针对发布序号 {body.serial}, "
+                    f"当前发布序号为 {serial}, 请核对当前发布版后重新提交"
+                ),
+            )
+        plan = json.loads(published["plan"])
+        pair = plan.get(paper_id)
+        if not pair or reviewer_id not in pair:
+            raise HTTPException(
+                status_code=404,
+                detail=f"当前发布版中论文 {paper_id} 未分配给 {reviewer_id}, 拒绝操作",
+            )
+        decision = conn.execute(
+            "SELECT state FROM assignment_decisions"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
+            (serial, paper_id, reviewer_id),
+        ).fetchone()
+        if decision is not None and decision["state"] == "recused":
+            raise HTTPException(status_code=409, detail="该任务已声明回避, 不能提交评语")
+        if decision is None or decision["state"] != "confirmed":
+            raise HTTPException(
+                status_code=409,
+                detail="该任务尚未确认, 仅已确认且未回避的任务可提交评语",
+            )
+        existing = conn.execute(
+            "SELECT score, comment, receipt, submitted_at FROM assignment_reviews"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
+            (serial, paper_id, reviewer_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["score"] == body.score and existing["comment"] == comment:
+                # 完全相同的重试: 幂等返回原收据
+                return {
+                    "ok": True,
+                    "paper_id": paper_id,
+                    "reviewer_id": reviewer_id,
+                    "serial": serial,
+                    "score": existing["score"],
+                    "comment": existing["comment"],
+                    "receipt": existing["receipt"],
+                    "submitted_at": existing["submitted_at"],
+                    "changed": False,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail="该任务已提交过评语, 同一有效任务只收一份; 内容不同的重复提交被拒绝",
+            )
+        receipt = _review_receipt(serial, paper_id, reviewer_id, body.score, comment, now)
+        conn.execute(
+            "INSERT INTO assignment_reviews"
+            "(serial, paper_id, reviewer_id, score, comment, receipt, submitted_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (serial, paper_id, reviewer_id, body.score, comment, receipt, now),
+        )
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "reviewer_id": reviewer_id,
+        "serial": serial,
+        "score": body.score,
+        "comment": comment,
+        "receipt": receipt,
+        "submitted_at": now,
+        "changed": True,
+    }
+
+
 @app.get("/reviewer/assignments")
 def reviewer_assignments(reviewer_id: str = Depends(require_reviewer)):
     """评审人凭自身凭据读取已分配给自己的匿名稿 (仅当前发布版, 不含作者机构)。
 
     - 已回避的论文立即从取稿列表中移除 (仅在 recused 中保留编号与本人填写的原因);
-    - 补位重新发布后, 不在新方案中的关系不再授权取稿。
+    - 补位重新发布后, 不在新方案中的关系不再授权取稿;
+    - reviews 仅列出本人当前有效 (已确认) 任务已提交的评语,
+      不包含另一评审人的评语。
     """
     with db.read_txn() as conn:
         row = _load_published(conn)
         if row is None:
-            return {"reviewer_id": reviewer_id, "serial": None, "assignments": [], "recused": []}
+            return {"reviewer_id": reviewer_id, "serial": None,
+                    "assignments": [], "recused": [], "reviews": []}
         serial = row["serial"]
         plan = json.loads(row["plan"])
         decisions = _load_decisions(conn, serial)
+        reviews = _load_reviews(conn, serial)
         mine = sorted(pid for pid, rs in plan.items() if reviewer_id in rs)
-        out, recused, states = [], [], {}
+        out, recused, states, my_reviews = [], [], {}, []
         for pid in mine:
             d = decisions.get((pid, reviewer_id))
             state = d["state"] if d else "pending"
@@ -558,6 +754,18 @@ def reviewer_assignments(reviewer_id: str = Depends(require_reviewer)):
             if state == "recused":
                 recused.append({"paper_id": pid, "reason": d["reason"], "decided_at": d["decided_at"]})
                 continue
+            if state == "confirmed":
+                rv = reviews.get((pid, reviewer_id))
+                if rv is not None:
+                    my_reviews.append(
+                        {
+                            "paper_id": pid,
+                            "score": rv["score"],
+                            "comment": rv["comment"],
+                            "receipt": rv["receipt"],
+                            "submitted_at": rv["submitted_at"],
+                        }
+                    )
             paper = conn.execute(
                 "SELECT paper_id, topics, manuscript FROM papers WHERE paper_id = ?", (pid,)
             ).fetchone()
@@ -575,6 +783,7 @@ def reviewer_assignments(reviewer_id: str = Depends(require_reviewer)):
         "assignments": out,
         "recused": recused,
         "states": states,
+        "reviews": my_reviews,
     }
 
 
@@ -604,7 +813,9 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
 
     成功后:
       - 当前发布版被新发布版替换 (发布序号 +1), 仅按新发布版授权取稿;
-      - 仍在新方案中的 (论文, 评审人) 槽位保留其确认状态;
+      - 仍在新方案中的 (论文, 评审人) 槽位保留其确认状态, 并连同该槽位
+        已提交的评语一并沿用 (收据号不变, 计入新方案进度);
+      - 被移出方案的槽位评语保留在原发布序号下, 仅供会务方追溯, 不计入新进度;
       - 无完整补位方案时 422, 当前发布版保持不变。
     """
     with db.write_txn() as conn:
@@ -646,8 +857,11 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
             ),
         )
         new_serial = serial + 1
-        # 仍在新方案中的槽位保留确认状态 (已回避槽位不可能出现在新方案中)
+        # 仍在新方案中的槽位保留确认状态 (已回避槽位不可能出现在新方案中),
+        # 其已提交的评语一并沿用到新发布序号下 (收据号与内容不变)
+        old_reviews = _load_reviews(conn, serial)
         carried = 0
+        carried_reviews = 0
         for pid, pair in new_plan.items():
             for rid in pair:
                 d = old_decisions.get((pid, rid))
@@ -659,11 +873,22 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
                         (new_serial, pid, rid, "confirmed", None, d["decided_at"]),
                     )
                     carried += 1
+                    rv = old_reviews.get((pid, rid))
+                    if rv is not None:
+                        conn.execute(
+                            "INSERT INTO assignment_reviews"
+                            "(serial, paper_id, reviewer_id, score, comment, receipt, submitted_at)"
+                            " VALUES (?,?,?,?,?,?,?)",
+                            (new_serial, pid, rid, rv["score"], rv["comment"],
+                             rv["receipt"], rv["submitted_at"]),
+                        )
+                        carried_reviews += 1
     return {
         "ok": True,
         "serial": new_serial,
         "revision": rev,
         "carried_confirmations": carried,
+        "carried_reviews": carried_reviews,
         "plan": new_plan,
     }
 

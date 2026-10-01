@@ -1,7 +1,8 @@
 # 双盲论文评审分配服务
 
 基于 **Python + FastAPI + SQLite** 的双盲评审分配服务。会务方凭本地密钥维护论文与评审人资料，
-求解器在硬约束下自动计算全局最优分配方案，支持预演、版本化发布与评审人匿名稿分发。
+求解器在硬约束下自动计算全局最优分配方案，支持预演、版本化发布、评审人匿名稿分发、
+确认/回避与补位，以及已确认任务的正式评语收集。
 
 ## 功能与规则
 
@@ -51,6 +52,23 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
   `base_revision` 与发布序号 `base_serial`，任一过期（期间有资料变更或任何新发布）即 `409`；
 - 补位发布成功后发布序号 +1，**仅按新发布版授权取稿**；仍在新方案中的
   （论文, 评审人）槽位**保留其确认状态**，被移出方案的关系不再授权取稿。
+
+**正式评语收集（已确认任务）**：评审人凭现有本人凭据，对**当前发布版中本人已确认且未回避**
+的任务提交正式评语（`POST /reviewer/assignments/{paper_id}/review`，携带发布序号 `serial`、
+1～5 整数评分 `score` 与非空评语 `comment`）：
+
+- 提交时在**同一个写事务**内核对发布序号、分配关系与决定状态：**过期序号**（`409`）、
+  未分配给本人或论文不存在（`404`）、**未确认**或**已回避**（`409`）、已被移出方案的
+  任务一律拒绝且**不落库**；
+- 同一有效任务**只收一份**评语：**完全相同的重试返回原收据**（`changed=false`，收据号不变），
+  **内容不同则 `409` 冲突**；评语提交**不推进资料修订号**；
+- 会务方按论文查看当前两名评审人的提交进度与评语（`GET /assignment/reviews`）；
+  历史发布序号上的评语列入 `archived` **仅供追溯，不计入当前进度**；
+- **补位发布**时，连续保留确认的槽位**沿用原评语**（内容与收据号不变，计入新方案进度，
+  响应含 `carried_reviews`）；被移出槽位的评语仅供会务方追溯；**同一评审人日后重新获得
+  该稿时不得复用旧评语**，须重新确认并重新提交；
+- 评审人取稿响应新增 `reviews`：仅本人当前有效（已确认）任务的评语，
+  看不到另一评审人的评语，也不含作者机构。
 
 **权限模型**：
 
@@ -119,14 +137,18 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` |
 | POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422` |
 | GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态 |
-| GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`；已回避论文不返稿，仅列于 `recused`） |
+| GET | `/assignment/reviews` | 会务方按论文查看当前两名评审人的评语提交进度与评语；历史评语在 `archived` 追溯 |
+| GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`；已回避论文不返稿，仅列于 `recused`；`reviews` 为本人当前有效任务的评语） |
 | POST | `/reviewer/assignments/{paper_id}/decision` | 评审人提交 `{"paper_id","decision":"confirm"|"recuse","reason"?}`；幂等；未分配 `404`，已回避再确认 `409`，空回避原因 `422` |
+| POST | `/reviewer/assignments/{paper_id}/review` | 评审人对已确认任务提交 `{"paper_id","serial","score","comment"}`；相同重试返回原收据，内容不同 `409`；过期序号/未确认/已回避 `409`，未分配 `404`，评分或评语非法 `422` |
 
 ## 调用示例
 
 完整可运行脚本见 [`examples/demo.sh`](examples/demo.sh)（服务启动后执行 `./examples/demo.sh`）；
-本轮"确认/回避 + 补位"流程见 [`examples/backfill.sh`](examples/backfill.sh)
-（`./examples/backfill.sh`，建议对新库运行）。
+"确认/回避 + 补位"流程见 [`examples/backfill.sh`](examples/backfill.sh)
+（`./examples/backfill.sh`，建议对新库运行）；
+本轮"正式评语收集"流程见 [`examples/reviews.sh`](examples/reviews.sh)
+（`./examples/reviews.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -188,6 +210,37 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 评审人取稿响应新增 `states`（本人在当前发布版各槽位的 `confirmed/recused/pending`）
 与 `recused`（已回避论文编号、本人填写的原因、时间）；`assignments` 中不再出现已回避论文。
 
+### 本轮用法：已确认任务的正式评语收集
+
+```bash
+# 11. 评审人确认任务后, 对当前发布版提交评语 (serial 取自取稿响应; 评分 1~5 整数, 评语非空)
+SERIAL=$(curl -s $BASE/reviewer/assignments \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' | python3 -c 'import sys,json;print(json.load(sys.stdin)["serial"])')
+curl -X POST $BASE/reviewer/assignments/P1/review \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' \
+  -d "{\"paper_id\": \"P1\", \"serial\": $SERIAL, \"score\": 5, \"comment\": \"创新点明确, 建议接收\"}"
+# -> {"ok":true,"score":5,"receipt":"rv_...","changed":true,...}
+#    完全相同的重试 -> changed=false 且收据号不变; 内容不同 -> 409; 过期序号/未确认/已回避 -> 409
+
+# 12. 会务方按论文查看两名评审人的提交进度与评语 (archived 为历史评语, 仅供追溯)
+curl $BASE/assignment/reviews -H "$ORG"
+# -> {"serial":S,"papers":{"P1":{"expected":2,"submitted":1,"reviewers":[
+#      {"reviewer_id":"R1","state":"confirmed","submitted":true,"review":{"score":5,...}},
+#      {"reviewer_id":"R2","state":"pending","submitted":false,"review":null}]}},
+#     "archived":[...]}
+
+# 13. 补位发布后: 连续保留确认的槽位沿用原评语 (carried_reviews=1, 收据号不变, 计入新进度);
+#     被移出槽位的评语转入 archived, 不计入新方案进度
+curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
+  -H 'Content-Type: application/json' -d '{"base_revision": N, "base_serial": S}'
+# -> {"ok":true,"serial":S+1,"carried_confirmations":1,"carried_reviews":1,"plan":{...}}
+
+# 14. 评审人查看本人已提交的评语 (仅本人当前有效任务; 无另一评审人评语与作者机构)
+curl $BASE/reviewer/assignments -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret'
+# -> {"reviews":[{"paper_id":"P1","score":5,"comment":"...","receipt":"rv_...",...}], ...}
+```
+
 预演响应示例（可行）：
 
 ```json
@@ -224,9 +277,9 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 | 状态码 | 场景 |
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
-| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己**的论文提交决定；尚无发布版时补位预演/发布 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认 |
-| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布 |
+| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；评审人对**未分配给自己**的论文提交决定或评语；尚无发布版时补位预演/发布、查询评语进度 |
+| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期；未确认/已回避任务提交评语；同一任务重复提交**内容不同**的评语 |
+| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分非 1～5 整数、评语为空 |
 
 排除/限制原因代码：`same_institution_as_author`（与作者同机构）、`on_reviewer_avoid_list`
 （在回避名单）、`hard_recusal_after_decline`（评审人发布后声明回避形成的硬回避）、
@@ -245,14 +298,16 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与评语
   solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断）
   db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务
   schemas.py  # 请求体模型与校验
-tests/test_api.py       # 原有 24 个接口与求解器测试（含并发发布测试）
-tests/test_backfill.py  # 本轮确认/回避/硬回避/补位预演与发布测试
+tests/test_api.py       # 原有接口与求解器测试（含并发发布测试）
+tests/test_backfill.py  # 确认/回避/硬回避/补位预演与发布测试
+tests/test_reviews.py   # 本轮评语收集/幂等/补位沿用与追溯/可见性测试
 examples/demo.sh        # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
-examples/backfill.sh    # 本轮端到端示例（决定 -> 补位预演 -> 双版本复核发布）
+examples/backfill.sh    # 确认/回避 -> 补位预演 -> 双版本复核发布 示例
+examples/reviews.sh     # 本轮端到端示例（确认 -> 提交评语 -> 进度 -> 补位沿用）
 Dockerfile / docker-compose.yml
 ```
 
