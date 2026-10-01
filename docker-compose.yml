@@ -1,0 +1,19 @@
+services:
+  review-assignment:
+    build: .
+    image: review-assignment:latest
+    container_name: review-assignment
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # 会务方本地密钥, 生产环境务必修改
+      ORGANIZER_KEY: ${ORGANIZER_KEY:-dev-organizer-key}
+      DB_PATH: /data/app.db
+      HOST: 0.0.0.0
+      PORT: 8000
+    volumes:
+      - review_data:/data
+    restart: unless-stopped
+
+volumes:
+  review_data:
